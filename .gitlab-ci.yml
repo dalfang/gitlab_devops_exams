@@ -11,12 +11,11 @@
 #     portable, and avoids cross-user (gitlab-runner vs ubuntu) permission
 #     issues on the shell executor.
 #
-# Branch -> environment mapping (linear promotion, matches the exam's
-# required order dev -> QA -> staging -> prod):
-#   develop -> dev       (auto)
-#   qa      -> qa        (auto)
-#   staging -> staging   (auto)
-#   main    -> prod      (manual, main branch only)
+# Every pipeline, on every branch, walks through all 4 environments in
+# order: deploy_dev -> deploy_qa -> deploy_staging run automatically;
+# deploy_prod only ever appears (as a manual button) when on the main
+# branch, per the exam's "production deploy is manual, main branch only"
+# requirement. stop_* jobs (manual) tear an environment's release down.
 
 variables:
   VM_IP: "34.250.208.164"
@@ -93,8 +92,6 @@ push:
   image: docker:latest
   services:
     - docker:dind
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
   before_script:
     - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
   script:
@@ -141,8 +138,6 @@ deploy_dev:
     name: development
     url: "http://$VM_IP:$NODEPORT_DEV"
     on_stop: stop_dev
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
 
 stop_dev:
   <<: *stop
@@ -152,8 +147,6 @@ stop_dev:
   environment:
     name: development
     action: stop
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
 
 deploy_qa:
   <<: *deploy
@@ -164,8 +157,6 @@ deploy_qa:
     name: qa
     url: "http://$VM_IP:$NODEPORT_QA"
     on_stop: stop_qa
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "qa"'
 
 stop_qa:
   <<: *stop
@@ -175,8 +166,6 @@ stop_qa:
   environment:
     name: qa
     action: stop
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "qa"'
 
 deploy_staging:
   <<: *deploy
@@ -187,8 +176,6 @@ deploy_staging:
     name: staging
     url: "http://$VM_IP:$NODEPORT_STAGING"
     on_stop: stop_staging
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "staging"'
 
 stop_staging:
   <<: *stop
@@ -198,8 +185,6 @@ stop_staging:
   environment:
     name: staging
     action: stop
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "staging"'
 
 deploy_prod:
   <<: *deploy
