@@ -1,90 +1,118 @@
 # CI/CD pipeline for the "examen" microservices app (gateway, users, orders)
 #
-# Runner: self-hosted shell executor on the k3s VM (tag: k3s). Because it's a
-# shell executor, `image:`/`services:` keywords are ignored by GitLab — jobs
-# below use `docker run` explicitly wherever a container is needed, and call
-# docker/kubectl/helm straight from the host, which already has them
-# installed and already has `docker login` + a working kubeconfig.
+# Architecture:
+#   - test / build / run(integration) / push run UNTAGGED on GitLab.com's free
+#     shared runners, using docker:dind. No dependency on the VM at all.
+#   - deploy_* / stop_* are tagged `onprem` and only run on our self-hosted
+#     shell-executor runner on the k3s VM, which has kubectl/helm installed.
+#     They authenticate to the cluster from the $KUBE_CONFIG CI/CD variable
+#     (type: File, contents = k3s's /etc/rancher/k3s/k3s.yaml) rather than
+#     relying on any kubeconfig already sitting on the VM's filesystem -
+#     portable, and avoids cross-user (gitlab-runner vs ubuntu) permission
+#     issues on the shell executor.
 #
 # Branch -> environment mapping:
 #   develop -> dev      (auto)
 #   staging -> staging  (auto)
 #   main    -> qa       (auto)   then   -> prod (manual, main only)
 
-stages:
-  - lint_test
-  - build
-  - integration_test
-  - deploy
-
 variables:
-  KUBECONFIG: "/home/ubuntu/.kube/config"
+  VM_IP: "34.250.208.164"
+  NODEPORT_DEV: "30080"
+  NODEPORT_QA: "30081"
+  NODEPORT_STAGING: "30082"
+  NODEPORT_PROD: "30083"
   HELM_CHART: "helm/examen"
-  IT_NETWORK: "examen-it-${CI_JOB_ID}"
 
-lint_test:
-  stage: lint_test
+stages:
+  - test
+  - build
+  - run
+  - push
+  - deploy_dev
+  - deploy_qa
+  - deploy_staging
+  - deploy_prod
+
+test:
+  stage: test
+  image: python:3.7.7
   script:
-    - |
-      set -e
-      for svc in gateway users orders; do
-        echo "===== $svc: lint + tests (python:3.7.7, matches the service Dockerfile) ====="
-        docker run --rm -v "$CI_PROJECT_DIR/$svc:/app" -w /app python:3.7.7 sh -c '
-          pip install --no-cache-dir -r requirements.txt -q &&
-          echo "--- flake8 (report only, non-blocking) ---" &&
-          (flake8 --max-line-length=120 --exclude=tests . || true) &&
-          echo "--- syntax / import smoke check ---" &&
-          python -m py_compile main.py &&
-          if [ -d tests ]; then
-            echo "--- unit tests ---"
-            for t in tests/*.py; do
-              base=$(basename "$t" .py)
-              [ "$base" = "__init__" ] && continue
-              echo ">> tests.$base"
-              python -m tests.$base
-            done
-          fi
-        '
+    - set -e
+    - for svc in gateway users orders; do
+        echo "===== $svc =====";
+        pip install --no-cache-dir -r "$svc/requirements.txt" -q;
+        (cd "$svc" && flake8 --max-line-length=120 --exclude=tests . || true);
+        python -m py_compile "$svc/main.py";
+        if [ -d "$svc/tests" ]; then
+          for t in "$svc"/tests/*.py; do
+            b=$(basename "$t" .py);
+            [ "$b" = "__init__" ] && continue;
+            (cd "$svc" && python -m "tests.$b");
+          done
+        fi;
       done
 
-build_push:
+build:
   stage: build
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+  image: docker:latest
+  services:
+    - docker:dind
   script:
-    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-    - |
-      set -e
-      for svc in gateway users orders; do
-        echo "===== Building $svc ====="
-        docker build -t "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA" -t "$DOCKERHUB_USERNAME/$svc:latest" "./$svc"
-        docker push "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA"
-        docker push "$DOCKERHUB_USERNAME/$svc:latest"
+    - for svc in gateway users orders; do
+        docker build -t "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA" "./$svc";
       done
 
-integration_test:
-  stage: integration_test
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+run:
+  stage: run
+  image: docker:latest
+  services:
+    - docker:dind
   script:
-    - docker network create "$IT_NETWORK"
-    - docker run -d --rm --name "it-users-$CI_JOB_ID" --network "$IT_NETWORK" --network-alias users "$DOCKERHUB_USERNAME/users:$CI_COMMIT_SHORT_SHA"
-    - docker run -d --rm --name "it-orders-$CI_JOB_ID" --network "$IT_NETWORK" --network-alias orders "$DOCKERHUB_USERNAME/orders:$CI_COMMIT_SHORT_SHA"
+    - for svc in gateway users orders; do
+        docker build -t "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA" "./$svc";
+      done
+    - docker network create examen-net
+    - docker run -d --network examen-net --name users "$DOCKERHUB_USERNAME/users:$CI_COMMIT_SHORT_SHA"
+    - docker run -d --network examen-net --name orders "$DOCKERHUB_USERNAME/orders:$CI_COMMIT_SHORT_SHA"
     - sleep 5
     - >
-      docker run -d --rm --name "it-gateway-$CI_JOB_ID" --network "$IT_NETWORK" -p 18001:8000
+      docker run -d --network examen-net --name gateway
       -e USERS_SERVICE_URL=http://users:8000 -e ORDERS_SERVICE_URL=http://orders:8000
       "$DOCKERHUB_USERNAME/gateway:$CI_COMMIT_SHORT_SHA"
     - sleep 5
-    - curl -sf http://localhost:18001/docs > /dev/null && echo "Integration check OK - gateway reaches users+orders"
+    - docker run --rm --network examen-net curlimages/curl:latest curl -sf http://gateway:8000/docs
+    - echo "Integration check OK - gateway reaches users+orders"
   after_script:
-    - docker rm -f "it-gateway-$CI_JOB_ID" "it-users-$CI_JOB_ID" "it-orders-$CI_JOB_ID" 2>/dev/null || true
-    - docker network rm "$IT_NETWORK" 2>/dev/null || true
+    - docker rm -f gateway users orders 2>/dev/null || true
+
+push:
+  stage: push
+  image: docker:latest
+  services:
+    - docker:dind
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+  script:
+    - for svc in gateway users orders; do
+        docker build -t "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA" -t "$DOCKERHUB_USERNAME/$svc:latest" "./$svc";
+        docker push "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA";
+        docker push "$DOCKERHUB_USERNAME/$svc:latest";
+      done
+
+.kubeconfig_setup:
+  script:
+    - rm -Rf ~/.kube && mkdir ~/.kube
+    - cat "$KUBE_CONFIG" > ~/.kube/config
+    - export KUBECONFIG=~/.kube/config
 
 .deploy: &deploy
-  stage: deploy
+  tags:
+    - onprem
   script:
-    - export KUBECONFIG=/home/ubuntu/.kube/config
+    - !reference [.kubeconfig_setup, script]
     - >
       helm upgrade --install examen "$HELM_CHART"
       --namespace "$NAMESPACE" --create-namespace
@@ -94,39 +122,103 @@ integration_test:
       --wait --timeout 2m
     - kubectl get deploy,pods,svc -n "$NAMESPACE"
 
+.stop: &stop
+  tags:
+    - onprem
+  when: manual
+  script:
+    - !reference [.kubeconfig_setup, script]
+    - helm uninstall examen -n "$NAMESPACE" || true
+
 deploy_dev:
   <<: *deploy
+  stage: deploy_dev
   variables:
     NAMESPACE: dev
   environment:
     name: development
+    url: "http://$VM_IP:$NODEPORT_DEV"
+    on_stop: stop_dev
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop"'
 
-deploy_staging:
-  <<: *deploy
+stop_dev:
+  <<: *stop
+  stage: deploy_dev
   variables:
-    NAMESPACE: staging
+    NAMESPACE: dev
   environment:
-    name: staging
+    name: development
+    action: stop
   rules:
-    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
 
 deploy_qa:
   <<: *deploy
+  stage: deploy_qa
   variables:
     NAMESPACE: qa
   environment:
     name: qa
+    url: "http://$VM_IP:$NODEPORT_QA"
+    on_stop: stop_qa
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
 
+stop_qa:
+  <<: *stop
+  stage: deploy_qa
+  variables:
+    NAMESPACE: qa
+  environment:
+    name: qa
+    action: stop
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy_staging:
+  <<: *deploy
+  stage: deploy_staging
+  variables:
+    NAMESPACE: staging
+  environment:
+    name: staging
+    url: "http://$VM_IP:$NODEPORT_STAGING"
+    on_stop: stop_staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+stop_staging:
+  <<: *stop
+  stage: deploy_staging
+  variables:
+    NAMESPACE: staging
+  environment:
+    name: staging
+    action: stop
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
 deploy_prod:
   <<: *deploy
+  stage: deploy_prod
   variables:
     NAMESPACE: prod
   environment:
     name: production
+    url: "http://$VM_IP:$NODEPORT_PROD"
+    on_stop: stop_prod
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: manual
+
+stop_prod:
+  <<: *stop
+  stage: deploy_prod
+  variables:
+    NAMESPACE: prod
+  environment:
+    name: production
+    action: stop
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
