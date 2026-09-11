@@ -1,0 +1,12 @@
+# dev environment overrides
+# NB: nodePort must be unique cluster-wide since dev/qa/staging/prod
+# all share the same single-node k3s cluster (one node can't bind the
+# same NodePort twice, even in different namespaces).
+services:
+  gateway:
+    replicaCount: 1
+    nodePort: 30080
+  users:
+    replicaCount: 1
+  orders:
+    replicaCount: 1

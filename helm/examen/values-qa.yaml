@@ -1,0 +1,9 @@
+# qa environment overrides
+services:
+  gateway:
+    replicaCount: 1
+    nodePort: 30081
+  users:
+    replicaCount: 1
+  orders:
+    replicaCount: 1

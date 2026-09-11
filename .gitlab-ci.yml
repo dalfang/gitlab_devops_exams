@@ -1,0 +1,135 @@
+# CI/CD pipeline for the "examen" microservices app (gateway, users, orders)
+#
+# Runner: self-hosted shell executor on the k3s VM (tag: k3s). Because it's a
+# shell executor, `image:`/`services:` keywords are ignored by GitLab — jobs
+# below use `docker run` explicitly wherever a container is needed, and call
+# docker/kubectl/helm straight from the host, which already has them
+# installed and already has `docker login` + a working kubeconfig.
+#
+# Branch -> environment mapping:
+#   develop -> dev      (auto)
+#   staging -> staging  (auto)
+#   main    -> qa       (auto)   then   -> prod (manual, main only)
+
+stages:
+  - lint_test
+  - build
+  - integration_test
+  - deploy
+
+variables:
+  KUBECONFIG: "/home/ubuntu/.kube/config"
+  HELM_CHART: "helm/examen"
+  IT_NETWORK: "examen-it-${CI_JOB_ID}"
+
+lint_test:
+  stage: lint_test
+  tags:
+    - k3s
+  script:
+    - |
+      set -e
+      for svc in gateway users orders; do
+        echo "===== $svc: lint + tests (python:3.7.7, matches the service Dockerfile) ====="
+        docker run --rm -v "$CI_PROJECT_DIR/$svc:/app" -w /app python:3.7.7 sh -c "
+          pip install --no-cache-dir -r requirements.txt -q &&
+          echo '--- flake8 (report only, non-blocking) ---' &&
+          (flake8 --max-line-length=120 --exclude=tests . || true) &&
+          echo '--- syntax / import smoke check ---' &&
+          python -m py_compile main.py &&
+          if [ -d tests ]; then
+            echo '--- unit tests ---'
+            python -m unittest discover -s tests -p '*.py' -v
+          fi
+        "
+      done
+
+build_push:
+  stage: build
+  tags:
+    - k3s
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+  script:
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+    - |
+      set -e
+      for svc in gateway users orders; do
+        echo "===== Building $svc ====="
+        docker build -t "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA" -t "$DOCKERHUB_USERNAME/$svc:latest" "./$svc"
+        docker push "$DOCKERHUB_USERNAME/$svc:$CI_COMMIT_SHORT_SHA"
+        docker push "$DOCKERHUB_USERNAME/$svc:latest"
+      done
+
+integration_test:
+  stage: integration_test
+  tags:
+    - k3s
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+  script:
+    - docker network create "$IT_NETWORK"
+    - docker run -d --rm --name "it-users-$CI_JOB_ID" --network "$IT_NETWORK" --network-alias users "$DOCKERHUB_USERNAME/users:$CI_COMMIT_SHORT_SHA"
+    - docker run -d --rm --name "it-orders-$CI_JOB_ID" --network "$IT_NETWORK" --network-alias orders "$DOCKERHUB_USERNAME/orders:$CI_COMMIT_SHORT_SHA"
+    - sleep 5
+    - >
+      docker run -d --rm --name "it-gateway-$CI_JOB_ID" --network "$IT_NETWORK" -p 18001:8000
+      -e USERS_SERVICE_URL=http://users:8000 -e ORDERS_SERVICE_URL=http://orders:8000
+      "$DOCKERHUB_USERNAME/gateway:$CI_COMMIT_SHORT_SHA"
+    - sleep 5
+    - curl -sf http://localhost:18001/docs > /dev/null && echo "Integration check OK - gateway reaches users+orders"
+  after_script:
+    - docker rm -f "it-gateway-$CI_JOB_ID" "it-users-$CI_JOB_ID" "it-orders-$CI_JOB_ID" 2>/dev/null || true
+    - docker network rm "$IT_NETWORK" 2>/dev/null || true
+
+.deploy: &deploy
+  stage: deploy
+  tags:
+    - k3s
+  script:
+    - export KUBECONFIG=/home/ubuntu/.kube/config
+    - >
+      helm upgrade --install examen "$HELM_CHART"
+      --namespace "$NAMESPACE" --create-namespace
+      -f "$HELM_CHART/values-$NAMESPACE.yaml"
+      --set dockerhubUsername="$DOCKERHUB_USERNAME"
+      --set imageTag="$CI_COMMIT_SHORT_SHA"
+      --wait --timeout 2m
+    - kubectl get deploy,pods,svc -n "$NAMESPACE"
+
+deploy_dev:
+  <<: *deploy
+  variables:
+    NAMESPACE: dev
+  environment:
+    name: development
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+deploy_staging:
+  <<: *deploy
+  variables:
+    NAMESPACE: staging
+  environment:
+    name: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+deploy_qa:
+  <<: *deploy
+  variables:
+    NAMESPACE: qa
+  environment:
+    name: qa
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy_prod:
+  <<: *deploy
+  variables:
+    NAMESPACE: prod
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual

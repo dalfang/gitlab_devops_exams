@@ -1,0 +1,7 @@
+The examen app has been deployed to namespace {{ .Release.Namespace }}.
+
+Gateway (the only public entrypoint) is reachable on:
+  http://<node-ip>:{{ (index .Values.services "gateway").nodePort }}/docs
+
+Check rollout status with:
+  kubectl get pods,svc -n {{ .Release.Namespace }}

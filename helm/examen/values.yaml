@@ -1,0 +1,35 @@
+# Default values for the examen chart.
+# Per-environment overrides live in values-dev.yaml / values-qa.yaml /
+# values-staging.yaml / values-prod.yaml and are passed with `-f` on top
+# of this file by the CI pipeline.
+
+dockerhubUsername: dalfang
+imageTag: latest
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+services:
+  gateway:
+    port: 8000
+    replicaCount: 1
+    serviceType: NodePort
+    nodePort: 30080
+    env:
+      USERS_SERVICE_URL: "http://users:8000"
+      ORDERS_SERVICE_URL: "http://orders:8000"
+  users:
+    port: 8000
+    replicaCount: 1
+    serviceType: ClusterIP
+    env: {}
+  orders:
+    port: 8000
+    replicaCount: 1
+    serviceType: ClusterIP
+    env: {}

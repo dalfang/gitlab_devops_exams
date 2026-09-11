@@ -1,0 +1,9 @@
+# staging environment overrides
+services:
+  gateway:
+    replicaCount: 2
+    nodePort: 30082
+  users:
+    replicaCount: 1
+  orders:
+    replicaCount: 1
