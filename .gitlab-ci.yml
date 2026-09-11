@@ -24,8 +24,6 @@ variables:
 
 lint_test:
   stage: lint_test
-  tags:
-    - k3s
   script:
     - |
       set -e
@@ -46,8 +44,6 @@ lint_test:
 
 build_push:
   stage: build
-  tags:
-    - k3s
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
   script:
@@ -63,8 +59,6 @@ build_push:
 
 integration_test:
   stage: integration_test
-  tags:
-    - k3s
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
   script:
@@ -84,8 +78,6 @@ integration_test:
 
 .deploy: &deploy
   stage: deploy
-  tags:
-    - k3s
   script:
     - export KUBECONFIG=/home/ubuntu/.kube/config
     - >
